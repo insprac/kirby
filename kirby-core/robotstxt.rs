@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-/// Represents a robots.txt file for a website, currently supports allow/disallow rules (including
-/// wildcards) and sitemaps.
+/// Represents a robots.txt file for a website, currently supports allow/disallow rules
+/// (including wildcards) and sitemaps.
 #[derive(Debug, Clone)]
 pub struct RobotsTxt {
     rules: HashMap<String, RobotsTxtRule>,
@@ -17,6 +17,8 @@ pub struct RobotsTxtRule {
 impl RobotsTxt {
     /// Parse a raw robots.txt file, this can not fail since any incorrectly formatted lines or
     /// unsupported directives are simply ignored.
+    ///
+    /// Directives are case insensitive so they will always match (when valid and supported).
     ///
     /// # Example
     ///
@@ -101,6 +103,29 @@ fn strip_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
+/// Matches wildcard patterns where * matches everything in between including '/' characters.
+/// If no wildcards are present it will simply match the start of the string.
+fn match_pattern(pattern: &str, string: &str) -> bool {
+    if !pattern.contains("*") && string.starts_with(pattern) {
+        return true;
+    }
+
+    fn match_recursive(p: &[char], s: &[char]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (Some('*'), _) => {
+                match_recursive(&p[1..], s) || (!s.is_empty() && match_recursive(p, &s[1..]))
+            }
+            (Some(pc), Some(sc)) if pc == sc => match_recursive(&p[1..], &s[1..]),
+            _ => false,
+        }
+    }
+
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    let string_chars: Vec<char> = string.chars().collect();
+    match_recursive(&pattern_chars, &string_chars)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +189,31 @@ mod tests {
         assert_eq!(kirby_rules.disallow, vec!["/".to_string()]);
 
         assert_eq!(robotstxt.sitemaps, vec!["https://www.example.com/sitemap.xml".to_string()])
+    }
+
+    #[test]
+    fn matches_patterns_correctly() {
+        let pattern = "/test/*.txt";
+        assert!(match_pattern(pattern, "/test/path/file.txt"));
+        assert!(!match_pattern(pattern, "/test/path/file.png"));
+
+        let pattern = "/test/*/something.html";
+        assert!(match_pattern(pattern, "/test/some/long/path/something.html"));
+        assert!(!match_pattern(pattern, "/test/some/long/pathsomething.html"));
+
+        let pattern = "/";
+        assert!(match_pattern(pattern, "/test/files/index.html"));
+        assert!(match_pattern(pattern, "/"));
+        assert!(!match_pattern(pattern, "test"));
+
+        let pattern = "*.html";
+        assert!(match_pattern(pattern, "/test/files/index.html"));
+        assert!(match_pattern(pattern, "test.html"));
+        assert!(!match_pattern(pattern, "/"));
+
+        let pattern = "/test/*/middle/prefix*/file.txt";
+        assert!(match_pattern(pattern, "/test/in/the/middle/prefixstillmatches/ok/file.txt"));
+        assert!(match_pattern(pattern, "/test/in/middle/prefix/file.txt"));
+        assert!(!match_pattern(pattern, "/test/middle/prefix/file.txt"));
     }
 }
