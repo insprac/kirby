@@ -3,20 +3,20 @@ use std::collections::HashMap;
 /// Represents a robots.txt file for a website, currently supports allow/disallow rules
 /// (including wildcards) and sitemaps.
 #[derive(Debug, Clone)]
-pub struct RobotsTxt {
-    rules: HashMap<String, RobotsTxtRule>,
-    sitemaps: Vec<String>,
+pub struct RobotsTxt<'a> {
+    /// Mapping of user-agent -> rule.
+    rules: HashMap<&'a str, RobotsTxtRule<'a>>,
+    /// A list of sitemaps if any were included in the robots.txt file.
+    sitemaps: Vec<&'a str>,
+    /// A list of all agents sorted by length for faster matching.
+    agents_ordered: Vec<&'a str>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct RobotsTxtRule {
-    allow: Vec<String>,
-    disallow: Vec<String>,
-}
-
-impl RobotsTxt {
+impl<'a> RobotsTxt<'a> {
     /// Parse a raw robots.txt file, this can not fail since any incorrectly formatted lines or
     /// unsupported directives are simply ignored.
+    ///
+    /// The file input must live as long as the created RobotsTxt.
     ///
     /// Directives are case insensitive so they will always match (when valid and supported).
     ///
@@ -37,10 +37,10 @@ impl RobotsTxt {
     /// let robotstxt = kirby_core::robotstxt::RobotsTxt::parse(robotstxt_file);
     /// println!("{robotstxt:?}");
     /// ```
-    pub fn parse(file: &str) -> Self {
-        let mut current_agent: Option<&str> = None;
-        let mut rules: HashMap<String, RobotsTxtRule> = HashMap::new();
-        let mut sitemaps: Vec<String> = Vec::new();
+    pub fn parse(file: &'a str) -> Self {
+        let mut current_agent: Option<&'a str> = None;
+        let mut rules: HashMap<&'a str, RobotsTxtRule> = HashMap::new();
+        let mut sitemaps: Vec<&'a str> = Vec::new();
 
         for line in file.lines() {
             let line = line.trim();
@@ -58,10 +58,10 @@ impl RobotsTxt {
                     }
 
                     rules
-                        .entry(agent.to_string())
+                        .entry(agent)
                         .or_insert(Default::default())
                         .allow
-                        .push(allow.trim().to_string());
+                        .push(allow.trim());
                 }
             } else if let Some(disallow) = strip_prefix(line, "disallow: ") {
                 if let Some(agent) = current_agent {
@@ -71,10 +71,10 @@ impl RobotsTxt {
                     }
 
                     rules
-                        .entry(agent.to_string())
+                        .entry(agent)
                         .or_insert(Default::default())
                         .disallow
-                        .push(disallow.trim().to_string());
+                        .push(disallow.trim());
                 }
             } else if let Some(sitemap) = strip_prefix(line, "sitemap: ") {
                 let sitemap = sitemap.trim();
@@ -82,11 +82,71 @@ impl RobotsTxt {
                     continue;
                 }
 
-                sitemaps.push(sitemap.to_string())
+                sitemaps.push(sitemap)
             }
         }
 
-        Self { rules, sitemaps }
+        // Get agents and sort them by longest to shortest.
+        let mut agents_ordered = rules.keys().map(|&a| a).collect::<Vec<&str>>();
+        agents_ordered.sort_by(|a, b| b.len().cmp(&a.len()));
+
+        // Sort all rule allow and disallow by longest to shortest
+        rules.iter_mut().for_each(|(_, rule)| {
+            rule.allow.sort_by(|a, b| b.len().cmp(&a.len()));
+            rule.disallow.sort_by(|a, b| b.len().cmp(&a.len()));
+        });
+
+        Self {
+            rules,
+            sitemaps,
+            agents_ordered,
+        }
+    }
+
+    pub fn is_allowed(&self, user_agent: &str, path: &str) -> bool {
+        let Some(rules) = self.get_agent_rules(user_agent) else {
+            return true;
+        };
+
+        rules.is_allowed(path)
+    }
+
+    fn find_matching_agent(&self, user_agent: &str) -> Option<&str> {
+        self.agents_ordered
+            .iter()
+            .find(|&&pattern| match_pattern(pattern, user_agent))
+            .map(|&a| a)
+    }
+
+    fn get_agent_rules(&self, user_agent: &str) -> Option<&RobotsTxtRule> {
+        self
+            .find_matching_agent(user_agent)
+            // Unwrapping is safe here because we know rules must contain the pattern returned from
+            // `self.find_matching_agent` is guaranteed to be a key.
+            .map(|pattern| self.rules.get(pattern).unwrap())
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct RobotsTxtRule<'a> {
+    allow: Vec<&'a str>,
+    disallow: Vec<&'a str>,
+}
+
+impl<'a> RobotsTxtRule<'a> {
+    /// Checks if a path is allowed for this rule, if there is are multiple allows and/or disallows
+    /// it will choose the most matching (longest length of the pattern).
+    ///
+    /// If no allow or disallow matches then the path is allowed.
+    fn is_allowed(&self, path: &str) -> bool {
+        let best_allow = self.allow.iter().find(|&&pattern| match_pattern(pattern, path));
+        let best_disallow = self.disallow.iter().find(|&&pattern| match_pattern(pattern, path));
+        match (best_allow, best_disallow) {
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (Some(allow), Some(disallow)) => allow.len() > disallow.len(),
+            (None, None) => true,
+        }
     }
 }
 
@@ -153,13 +213,18 @@ mod tests {
 
         let wildcard_rules = robotstxt.rules.get("*").unwrap();
         assert_eq!(wildcard_rules.allow, Vec::<String>::new());
-        assert_eq!(wildcard_rules.disallow, vec!["/".to_string()]);
+        assert_eq!(wildcard_rules.disallow, vec!["/"]);
 
         let kirby_rules = robotstxt.rules.get("KirbyBot").unwrap();
-        assert_eq!(kirby_rules.allow, vec!["/".to_string()]);
-        assert_eq!(kirby_rules.disallow, vec!["/prevented/".to_string()]);
+        assert_eq!(kirby_rules.allow, vec!["/"]);
+        assert_eq!(kirby_rules.disallow, vec!["/prevented/"]);
 
-        assert_eq!(robotstxt.sitemaps, vec!["https://www.example.com/sitemap.xml".to_string()])
+        assert_eq!(
+            robotstxt.sitemaps,
+            vec!["https://www.example.com/sitemap.xml"]
+        );
+
+        assert_eq!(robotstxt.agents_ordered, vec!["KirbyBot", "*"]);
     }
 
     #[test]
@@ -181,14 +246,19 @@ mod tests {
 
         let robotstxt = RobotsTxt::parse(robotstxt_file);
 
-        let user_agents = robotstxt.rules.keys().collect::<Vec<&String>>();
+        let user_agents = robotstxt.rules.keys().map(|&a| a).collect::<Vec<&str>>();
         assert_eq!(user_agents, vec!["Kirby"]);
 
         let kirby_rules = robotstxt.rules.get("Kirby").unwrap();
-        assert_eq!(kirby_rules.allow, vec!["/".to_string(), "/something".to_string()]);
-        assert_eq!(kirby_rules.disallow, vec!["/".to_string()]);
+        assert_eq!(kirby_rules.allow, vec!["/", "/something"]);
+        assert_eq!(kirby_rules.disallow, vec!["/"]);
 
-        assert_eq!(robotstxt.sitemaps, vec!["https://www.example.com/sitemap.xml".to_string()])
+        assert_eq!(
+            robotstxt.sitemaps,
+            vec!["https://www.example.com/sitemap.xml"]
+        );
+
+        assert_eq!(robotstxt.agents_ordered, vec!["Kirby"]);
     }
 
     #[test]
@@ -198,8 +268,14 @@ mod tests {
         assert!(!match_pattern(pattern, "/test/path/file.png"));
 
         let pattern = "/test/*/something.html";
-        assert!(match_pattern(pattern, "/test/some/long/path/something.html"));
-        assert!(!match_pattern(pattern, "/test/some/long/pathsomething.html"));
+        assert!(match_pattern(
+            pattern,
+            "/test/some/long/path/something.html"
+        ));
+        assert!(!match_pattern(
+            pattern,
+            "/test/some/long/pathsomething.html"
+        ));
 
         let pattern = "/";
         assert!(match_pattern(pattern, "/test/files/index.html"));
@@ -212,8 +288,45 @@ mod tests {
         assert!(!match_pattern(pattern, "/"));
 
         let pattern = "/test/*/middle/prefix*/file.txt";
-        assert!(match_pattern(pattern, "/test/in/the/middle/prefixstillmatches/ok/file.txt"));
+        assert!(match_pattern(
+            pattern,
+            "/test/in/the/middle/prefixstillmatches/ok/file.txt"
+        ));
         assert!(match_pattern(pattern, "/test/in/middle/prefix/file.txt"));
         assert!(!match_pattern(pattern, "/test/middle/prefix/file.txt"));
+    }
+
+    #[test]
+    fn find_matching_agent() {
+        let robotstxt_file = r#"
+        User-agent: T*
+        Allow: /
+
+        User-agent: KirbyBot/*
+        Allow: /
+
+        User-agent: Kirby*
+        Allow: /
+
+        User-agent: GoogleBot
+        Disallow: /
+        "#;
+
+        let robotstxt = RobotsTxt::parse(robotstxt_file);
+        assert_eq!(robotstxt.find_matching_agent("Kirby"), Some("Kirby*"));
+        assert_eq!(robotstxt.find_matching_agent("KirbyBot"), Some("Kirby*"));
+        assert_eq!(
+            robotstxt.find_matching_agent("KirbyBot/1.0"),
+            Some("KirbyBot/*")
+        );
+        assert_eq!(
+            robotstxt.find_matching_agent("GoogleBot"),
+            Some("GoogleBot")
+        );
+        assert_eq!(
+            robotstxt.find_matching_agent("GoogleBot/1.0"),
+            Some("GoogleBot")
+        );
+        assert_eq!(robotstxt.find_matching_agent("SomethingElse"), None);
     }
 }
